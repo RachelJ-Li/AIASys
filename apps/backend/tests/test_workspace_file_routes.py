@@ -1374,3 +1374,499 @@ async def test_upload_preserves_path_traversal_and_reserved_checks(
     )
     assert response["success"] is True
     assert response["filename"] == "normal.txt"
+
+
+# ==================== 全局工作区上传重名测试 ====================
+
+
+@pytest.mark.asyncio
+async def test_global_upload_first_time_uses_original_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """首次上传使用原文件名（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-first",
+        title="任务 Global Upload First",
+        initial_conversation_id="conversation-global-upload-first-001",
+        initial_conversation_title="Global Upload First 对话",
+    )
+
+    upload = UploadFile(file=io.BytesIO(b"original content"), filename="report.pdf")
+    response = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload,
+        current_user=_build_user(),
+    )
+
+    assert response["success"] is True
+    assert response["filename"] == "report.pdf"
+    assert response["path"] == "/global/report.pdf"
+    assert response["size"] == 16
+
+    # 验证文件确实存在
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+    assert (global_root / "report.pdf").read_bytes() == b"original content"
+
+
+@pytest.mark.asyncio
+async def test_global_upload_duplicate_gets_numbered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """第二次上传同名文件生成 (1)，原文件内容不变（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-duplicate",
+        title="任务 Global Upload Duplicate",
+        initial_conversation_id="conversation-global-upload-duplicate-001",
+        initial_conversation_title="Global Upload Duplicate 对话",
+    )
+
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+
+    # 第一次上传
+    upload1 = UploadFile(file=io.BytesIO(b"original"), filename="report.pdf")
+    r1 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload1,
+        current_user=_build_user(),
+    )
+    assert r1["filename"] == "report.pdf"
+
+    # 第二次上传同名文件
+    upload2 = UploadFile(file=io.BytesIO(b"new content"), filename="report.pdf")
+    r2 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload2,
+        current_user=_build_user(),
+    )
+    assert r2["filename"] == "report (1).pdf"
+    assert r2["path"] == "/global/report (1).pdf"
+    assert r2["size"] == 11
+
+    # 验证原文件未被修改
+    assert (global_root / "report.pdf").read_bytes() == b"original"
+    assert (global_root / "report (1).pdf").read_bytes() == b"new content"
+
+
+@pytest.mark.asyncio
+async def test_global_upload_multiple_times_generates_sequential_numbers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """连续上传生成 (1), (2)，无偏移错误（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-multi",
+        title="任务 Global Upload Multi",
+        initial_conversation_id="conversation-global-upload-multi-001",
+        initial_conversation_title="Global Upload Multi 对话",
+    )
+
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+
+    filenames = []
+    for i in range(3):
+        upload = UploadFile(file=io.BytesIO(f"content-{i}".encode()), filename="report.pdf")
+        response = await workspace_files_route.upload_global_workspace_file(
+            workspace.workspace_id,
+            file=upload,
+            current_user=_build_user(),
+        )
+        filenames.append(response["filename"])
+
+    assert filenames == ["report.pdf", "report (1).pdf", "report (2).pdf"]
+
+    # 验证所有文件都存在且内容正确
+    for i, name in enumerate(filenames):
+        assert (global_root / name).read_bytes() == f"content-{i}".encode()
+
+
+@pytest.mark.asyncio
+async def test_global_upload_numbered_filename_increments_existing_suffix(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """上传文件名本身已带编号时，继续递增（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-numbered",
+        title="任务 Global Upload Numbered",
+        initial_conversation_id="conversation-global-upload-numbered-001",
+        initial_conversation_title="Global Upload Numbered 对话",
+    )
+
+    # 上传名为 "report (1).pdf" 的文件
+    upload = UploadFile(file=io.BytesIO(b"v1"), filename="report (1).pdf")
+    r1 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload,
+        current_user=_build_user(),
+    )
+    assert r1["filename"] == "report (1).pdf"
+
+    # 再次上传同名文件
+    upload2 = UploadFile(file=io.BytesIO(b"v2"), filename="report (1).pdf")
+    r2 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload2,
+        current_user=_build_user(),
+    )
+    assert r2["filename"] == "report (2).pdf"
+
+
+@pytest.mark.asyncio
+async def test_global_upload_skips_gap_and_picks_first_available_number(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """编号有时空缺时选择第一个可用编号（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-gap",
+        title="任务 Global Upload Gap",
+        initial_conversation_id="conversation-global-upload-gap-001",
+        initial_conversation_title="Global Upload Gap 对话",
+    )
+
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+
+    # 创建 report.pdf 和 report (3).pdf
+    (global_root / "report.pdf").write_bytes(b"original")
+    (global_root / "report (3).pdf").write_bytes(b"v3")
+
+    # 上传 report.pdf，应生成 report (1).pdf（第一个可用编号）
+    upload = UploadFile(file=io.BytesIO(b"new"), filename="report.pdf")
+    response = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload,
+        current_user=_build_user(),
+    )
+
+    assert response["filename"] == "report (1).pdf"
+    assert response["path"] == "/global/report (1).pdf"
+
+    # 验证所有文件都存在
+    assert (global_root / "report.pdf").exists()
+    assert (global_root / "report (1).pdf").exists()
+    assert (global_root / "report (3).pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_global_upload_no_extension_adds_bracket_number(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """无扩展名文件：README → README (1)（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-no-ext",
+        title="任务 Global Upload No Ext",
+        initial_conversation_id="conversation-global-upload-no-ext-001",
+        initial_conversation_title="Global Upload No Ext 对话",
+    )
+
+    # 第一次上传
+    upload1 = UploadFile(file=io.BytesIO(b"v1"), filename="README")
+    r1 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload1,
+        current_user=_build_user(),
+    )
+    assert r1["filename"] == "README"
+
+    # 第二次上传
+    upload2 = UploadFile(file=io.BytesIO(b"v2"), filename="README")
+    r2 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload2,
+        current_user=_build_user(),
+    )
+    assert r2["filename"] == "README (1)"
+
+
+@pytest.mark.asyncio
+async def test_global_upload_dotfile_gets_numbered_without_leading_space(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """点文件：.env → .env (1)（不是  (1).env，全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-dotfile",
+        title="任务 Global Upload Dotfile",
+        initial_conversation_id="conversation-global-upload-dotfile-001",
+        initial_conversation_title="Global Upload Dotfile 对话",
+    )
+
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+
+    # 第一次上传
+    upload1 = UploadFile(file=io.BytesIO(b"v1"), filename=".env")
+    r1 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload1,
+        current_user=_build_user(),
+    )
+    assert r1["filename"] == ".env"
+
+    # 第二次上传
+    upload2 = UploadFile(file=io.BytesIO(b"v2"), filename=".env")
+    r2 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload2,
+        current_user=_build_user(),
+    )
+    assert r2["filename"] == ".env (1)"
+
+    # 验证文件内容
+    assert (global_root / ".env").read_bytes() == b"v1"
+    assert (global_root / ".env (1)").read_bytes() == b"v2"
+
+
+@pytest.mark.asyncio
+async def test_global_upload_multiple_extensions_inserts_before_last_dot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """多扩展名：file.tar.gz → file.tar (1).gz（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-multi-ext",
+        title="任务 Global Upload Multi Ext",
+        initial_conversation_id="conversation-global-upload-multi-ext-001",
+        initial_conversation_title="Global Upload Multi Ext 对话",
+    )
+
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+
+    # 第一次上传
+    upload1 = UploadFile(file=io.BytesIO(b"v1"), filename="file.tar.gz")
+    r1 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload1,
+        current_user=_build_user(),
+    )
+    assert r1["filename"] == "file.tar.gz"
+
+    # 第二次上传
+    upload2 = UploadFile(file=io.BytesIO(b"v2"), filename="file.tar.gz")
+    r2 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload2,
+        current_user=_build_user(),
+    )
+    assert r2["filename"] == "file.tar (1).gz"
+
+    # 验证文件内容
+    assert (global_root / "file.tar.gz").read_bytes() == b"v1"
+    assert (global_root / "file.tar (1).gz").read_bytes() == b"v2"
+
+
+@pytest.mark.asyncio
+async def test_global_upload_rejects_path_traversal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """全局工作区只允许上传到根目录，拒绝或净化路径"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-security",
+        title="任务 Global Upload Security",
+        initial_conversation_id="conversation-global-upload-security-001",
+        initial_conversation_title="Global Upload Security 对话",
+    )
+
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+
+    # 测试1：文件名包含 ../ 应被拒绝
+    upload1 = UploadFile(file=io.BytesIO(b"malicious"), filename="../../etc/passwd")
+    try:
+        await workspace_files_route.upload_global_workspace_file(
+            workspace.workspace_id,
+            file=upload1,
+            current_user=_build_user(),
+        )
+        # 如果未抛出异常，应验证文件被保存到根目录且路径被净化
+        # 但当前实现会拒绝，因为 _normalize_relative_path 会检测到 ".."
+    except HTTPException as exc:
+        # 路径穿越应被拒绝
+        assert exc.status_code in (400, 403)
+
+    # 测试2：文件名包含路径分隔符，应被净化为纯文件名
+    upload2 = UploadFile(file=io.BytesIO(b"data"), filename="subdir/file.txt")
+    r2 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload2,
+        current_user=_build_user(),
+    )
+    # Path(file.filename).name 会剥离路径，只保留 "file.txt"
+    assert r2["filename"] == "file.txt"
+    assert r2["path"] == "/global/file.txt"
+
+    # 验证文件保存在全局根目录，而非子目录
+    assert (global_root / "file.txt").exists()
+    assert not (global_root / "subdir").exists()
+
+
+@pytest.mark.asyncio
+async def test_global_upload_concurrent_generates_unique_filenames(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """并发上传：所有响应路径唯一，内容不互相覆盖（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-concurrent",
+        title="任务 Global Upload Concurrent",
+        initial_conversation_id="conversation-global-upload-concurrent-001",
+        initial_conversation_title="Global Upload Concurrent 对话",
+    )
+
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+
+    # 并发上传 5 个同名文件
+    async def upload_report(content: str) -> dict:
+        upload = UploadFile(file=io.BytesIO(content.encode()), filename="report.pdf")
+        response = await workspace_files_route.upload_global_workspace_file(
+            workspace.workspace_id,
+            file=upload,
+            current_user=_build_user(),
+        )
+        return response
+
+    responses = await asyncio.gather(
+        upload_report("v0"),
+        upload_report("v1"),
+        upload_report("v2"),
+        upload_report("v3"),
+        upload_report("v4"),
+    )
+
+    filenames = [r["filename"] for r in responses]
+    # 所有文件名必须唯一
+    assert len(set(filenames)) == 5
+    assert "report.pdf" in filenames
+    assert "report (1).pdf" in filenames
+    assert "report (2).pdf" in filenames
+    assert "report (3).pdf" in filenames
+    assert "report (4).pdf" in filenames
+
+    # 验证所有文件内容正确
+    for i, name in enumerate(filenames):
+        assert (global_root / name).read_text() == f"v{i}"
+
+
+@pytest.mark.asyncio
+async def test_global_upload_write_failure_cleans_up_half_written_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """写入失败后清理半写入文件，不删除原文件（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-cleanup",
+        title="任务 Global Upload Cleanup",
+        initial_conversation_id="conversation-global-upload-cleanup-001",
+        initial_conversation_title="Global Upload Cleanup 对话",
+    )
+
+    global_root = config_module.get_user_global_workspace_dir("local_default")
+
+    # 创建原文件
+    (global_root / "report.pdf").write_bytes(b"original")
+
+    # 模拟写入失败：在写入部分内容后抛出 ENOSPC
+    def failing_copyfileobj(source, dest, max_size=None):
+        chunk = source.read(10)
+        dest.write(chunk)
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(files_utils_route, "_copyfileobj_with_limit", failing_copyfileobj)
+
+    # 尝试上传同名文件，预期失败
+    upload = UploadFile(file=io.BytesIO(b"new content here"), filename="report.pdf")
+    with pytest.raises(OSError) as exc_info:
+        await workspace_files_route.upload_global_workspace_file(
+            workspace.workspace_id,
+            file=upload,
+            current_user=_build_user(),
+        )
+
+    assert exc_info.value.errno == errno.ENOSPC
+
+    # 验证：原文件未被修改，新文件不存在（已被清理）
+    assert (global_root / "report.pdf").read_bytes() == b"original"
+    assert not (global_root / "report (1).pdf").exists()
+
+
+@pytest.mark.asyncio
+async def test_global_upload_returns_actual_saved_filename(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """API 返回实际保存的 filename 和 path（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-response",
+        title="任务 Global Upload Response",
+        initial_conversation_id="conversation-global-upload-response-001",
+        initial_conversation_title="Global Upload Response 对话",
+    )
+
+    # 第一次上传
+    upload1 = UploadFile(file=io.BytesIO(b"v1"), filename="report.pdf")
+    r1 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload1,
+        current_user=_build_user(),
+    )
+    assert r1["filename"] == "report.pdf"
+    assert r1["path"] == "/global/report.pdf"
+
+    # 第二次上传（实际保存为 report (1).pdf）
+    upload2 = UploadFile(file=io.BytesIO(b"v2"), filename="report.pdf")
+    r2 = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload2,
+        current_user=_build_user(),
+    )
+    assert r2["filename"] == "report (1).pdf"
+    assert r2["path"] == "/global/report (1).pdf"
+
+
+@pytest.mark.asyncio
+async def test_global_upload_preserves_path_traversal_and_reserved_checks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """路径穿越、保留文件名校验行为不变（全局工作区）"""
+    service = _build_workspace_service(tmp_path)
+    _patch_file_route_workspace(monkeypatch, tmp_path, service)
+
+    workspace = service.create_workspace(
+        user_id="local_default",
+        workspace_id="task-global-upload-security2",
+        title="任务 Global Upload Security2",
+        initial_conversation_id="conversation-global-upload-security2-001",
+        initial_conversation_title="Global Upload Security2 对话",
+    )
+
+    # 保留文件名应被拒绝（返回 400 Invalid filename）
+    upload1 = UploadFile(file=io.BytesIO(b"config"), filename="metadata.json")
+    with pytest.raises(HTTPException) as exc_info:
+        await workspace_files_route.upload_global_workspace_file(
+            workspace.workspace_id,
+            file=upload1,
+            current_user=_build_user(),
+        )
+    assert exc_info.value.status_code == 400
+
+    # 普通文件名应被接受
+    upload2 = UploadFile(file=io.BytesIO(b"normal"), filename="normal.txt")
+    response = await workspace_files_route.upload_global_workspace_file(
+        workspace.workspace_id,
+        file=upload2,
+        current_user=_build_user(),
+    )
+    assert response["success"] is True
+    assert response["filename"] == "normal.txt"

@@ -2305,24 +2305,23 @@ async def upload_global_workspace_file(
         safe_filename,
     )
     os.makedirs(_sys_path(global_path.parent), exist_ok=True)
-    _record_file_history(
-        _resolve_user_global_workspace_root(current_user.user_id),
-        safe_filename,
-        operation="before_overwrite",
-        current_user=current_user,
-    )
-    with open(_sys_path(global_path), "wb") as f:
-        from .files_utils import _copyfileobj_with_limit
 
-        _copyfileobj_with_limit(file.file, f)
+    # 执行写入（自动处理重名）
+    def _write_upload_file():
+        return _write_file_with_unique_name(global_path, file)
 
-    logger.info("全局工作区文件上传: %s/%s", current_user.user_id, safe_filename)
+    actual_path, uploaded_size = await asyncio.to_thread(_write_upload_file)
+
+    # 返回实际保存的文件名（可能与请求不同）
+    actual_filename = actual_path.name
+
+    logger.info("全局工作区文件上传: %s/%s", current_user.user_id, actual_filename)
 
     return {
         "success": True,
-        "filename": safe_filename,
-        "path": f"/global/{safe_filename}",
-        "size": global_path.stat().st_size,
+        "filename": actual_filename,
+        "path": f"/global/{actual_filename}",
+        "size": uploaded_size,
         "uploaded_by": current_user.user_id,
     }
 
