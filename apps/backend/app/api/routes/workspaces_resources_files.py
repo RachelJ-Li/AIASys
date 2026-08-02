@@ -11,6 +11,7 @@ import asyncio
 import logging
 import mimetypes
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Annotated, Literal
@@ -893,6 +894,106 @@ async def download_workspace_file(
     )
 
 
+def split_base_and_ext(filename: str) -> tuple[str, str]:
+    """分离文件名主干和扩展名（在最后一个点处分割）
+
+    规则：
+    - "report.pdf" → ("report", ".pdf")
+    - "file.tar.gz" → ("file.tar", ".gz")
+    - "README" → ("README", "")
+    - ".env" → (".env", "")  ← 点文件视为主文件名
+
+    注意：
+    - dot_pos <= 0 时视为无扩展名（点文件或纯文件名）
+    """
+    dot_pos = filename.rfind(".")
+    if dot_pos <= 0:
+        return filename, ""
+    return filename[:dot_pos], filename[dot_pos:]
+
+
+def get_next_numbered_name(filename: str) -> str:
+    """生成下一个编号变体（末尾数字递增）
+
+    规则：
+    - "report.pdf" → "report (1).pdf"
+    - "report (1).pdf" → "report (2).pdf"
+    - "file (2026) final.pdf" → "file (2026) final (1).pdf"
+    - "file.tar.gz" → "file.tar (1).gz"
+    """
+    base, ext = split_base_and_ext(filename)
+    # re.match 从开头匹配到末尾，确保只匹配最后一个 "(数字)"
+    match = re.match(r"^(.*) \((\d+)\)$", base)
+    if match:
+        prefix = match.group(1)
+        n = int(match.group(2)) + 1
+        return f"{prefix} ({n}){ext}"
+    else:
+        return f"{base} (1){ext}"
+
+
+def _write_file_with_unique_name(
+    target_path: Path,
+    file: UploadFile,
+) -> tuple[Path, int]:
+    """使用 xb 排他性创建，自动处理重名，返回 (实际路径, 写入大小)
+
+    并发安全：依赖文件系统原子性判断，不预先扫描目录
+    异常清理：写入失败时删除本次创建的文件
+
+    流程：
+    1. 尝试创建候选文件（"xb" 模式）
+       - 成功：进入写入阶段
+       - FileExistsError：递增编号，生成下一个候选名
+    2. 写入文件内容
+       - 成功：返回实际路径和大小
+       - 异常：删除本次创建的文件，重新抛出异常
+    """
+    from .files_utils import _copyfileobj_with_limit
+
+    candidate_name = target_path.name
+
+    while True:
+        candidate_path = target_path.parent / candidate_name
+
+        # === 阶段1：排他性创建（原子操作）===
+        try:
+            output = open(_sys_path(candidate_path), "xb")
+        except FileExistsError:
+            # 文件已存在（可能是并发场景），生成下一个候选名
+            candidate_name = get_next_numbered_name(candidate_name)
+            continue
+
+        # === 阶段2：写入文件内容 ===
+        try:
+            with output:
+                size = _copyfileobj_with_limit(file.file, output)
+            # 写入成功，返回实际路径和大小
+            return candidate_path, size
+
+        except Exception:
+            # 写入失败：关闭文件句柄、删除本次创建的文件
+            try:
+                if not output.closed:
+                    output.close()
+            except Exception:
+                pass
+
+            # 删除本次创建的文件（可能是空文件或半写入文件）
+            try:
+                os.unlink(_sys_path(candidate_path))
+            except OSError as cleanup_exc:
+                # 清理失败记录警告日志，不静默忽略
+                logger.warning(
+                    "Failed to remove incomplete upload: %s (error: %s)",
+                    candidate_path,
+                    cleanup_exc,
+                )
+
+            # 重新抛出原始异常，保留完整 traceback
+            raise
+
+
 @router.post("/{workspace_id}/files/upload")
 async def upload_workspace_file(
     workspace_id: str,
@@ -920,30 +1021,22 @@ async def upload_workspace_file(
 
     file_path = _ensure_path_within_root(workspace_root, normalized_path)
     os.makedirs(_sys_path(file_path.parent), exist_ok=True)
-    _record_file_history(
-        workspace_root,
-        normalized_path,
-        operation="before_overwrite",
-        current_user=current_user,
-    )
 
+    # 执行写入（自动处理重名）
     def _write_upload_file():
-        with open(_sys_path(file_path), "wb") as f:
-            from .files_utils import _copyfileobj_with_limit
+        return _write_file_with_unique_name(file_path, file)
 
-            _copyfileobj_with_limit(file.file, f)
-        return file_path.stat().st_size
+    actual_path, uploaded_size = await asyncio.to_thread(_write_upload_file)
 
-    uploaded_size = await asyncio.to_thread(_write_upload_file)
+    # 返回实际保存的文件名（可能与请求不同）
+    actual_filename = actual_path.relative_to(workspace_root).as_posix()
 
-    logger.info(
-        f"工作区文件上传: {current_user.user_id}/{workspace_id}/{normalized_path.as_posix()}"
-    )
+    logger.info(f"工作区文件上传: {current_user.user_id}/{workspace_id}/{actual_filename}")
 
     return {
         "success": True,
-        "filename": normalized_path.as_posix(),
-        "path": f"/workspace/{normalized_path.as_posix()}",
+        "filename": actual_filename,
+        "path": f"/workspace/{actual_filename}",
         "size": uploaded_size,
         "uploaded_by": current_user.user_id,
     }
@@ -2212,24 +2305,23 @@ async def upload_global_workspace_file(
         safe_filename,
     )
     os.makedirs(_sys_path(global_path.parent), exist_ok=True)
-    _record_file_history(
-        _resolve_user_global_workspace_root(current_user.user_id),
-        safe_filename,
-        operation="before_overwrite",
-        current_user=current_user,
-    )
-    with open(_sys_path(global_path), "wb") as f:
-        from .files_utils import _copyfileobj_with_limit
 
-        _copyfileobj_with_limit(file.file, f)
+    # 执行写入（自动处理重名）
+    def _write_upload_file():
+        return _write_file_with_unique_name(global_path, file)
 
-    logger.info("全局工作区文件上传: %s/%s", current_user.user_id, safe_filename)
+    actual_path, uploaded_size = await asyncio.to_thread(_write_upload_file)
+
+    # 返回实际保存的文件名（可能与请求不同）
+    actual_filename = actual_path.name
+
+    logger.info("全局工作区文件上传: %s/%s", current_user.user_id, actual_filename)
 
     return {
         "success": True,
-        "filename": safe_filename,
-        "path": f"/global/{safe_filename}",
-        "size": global_path.stat().st_size,
+        "filename": actual_filename,
+        "path": f"/global/{actual_filename}",
+        "size": uploaded_size,
         "uploaded_by": current_user.user_id,
     }
 
