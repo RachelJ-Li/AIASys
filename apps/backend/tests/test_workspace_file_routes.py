@@ -984,10 +984,15 @@ async def test_upload_numbered_filename_increments_existing_suffix(
 
 
 @pytest.mark.asyncio
-async def test_upload_skips_gap_and_picks_first_available_number(
+async def test_upload_increments_past_occupied_numbers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """编号有时空缺时选择第一个可用编号"""
+    """递增试探：从 (1) 起逐个尝试，跳过已占用编号
+
+    实现不扫描目录找空缺，而是从候选名开始逐个递增：
+    report.pdf 占用 → report (1).pdf 占用 → report (2).pdf 可用。
+    因此已占用的连续编号会被逐个跳过，落在第一个真正可用的编号上。
+    """
     service = _build_workspace_service(tmp_path)
     _patch_file_route_workspace(monkeypatch, tmp_path, service)
 
@@ -1001,11 +1006,11 @@ async def test_upload_skips_gap_and_picks_first_available_number(
 
     workspace_dir = service._get_workspace_dir("local_default", "task-upload-gap")
 
-    # 创建 report.pdf 和 report (3).pdf
+    # 预置连续占用的 report.pdf 与 report (1).pdf
     (workspace_dir / "report.pdf").write_bytes(b"original")
-    (workspace_dir / "report (3).pdf").write_bytes(b"v3")
+    (workspace_dir / "report (1).pdf").write_bytes(b"v1")
 
-    # 上传 report.pdf，应生成 report (1).pdf（第一个可用编号）
+    # 上传 report.pdf：(1) 已占用，应递增到 (2)
     upload = UploadFile(file=io.BytesIO(b"new"), filename="report.pdf")
     response = await workspace_files_route.upload_workspace_file(
         workspace.workspace_id,
@@ -1014,13 +1019,13 @@ async def test_upload_skips_gap_and_picks_first_available_number(
         current_user=_build_user(),
     )
 
-    assert response["filename"] == "report (1).pdf"
-    assert response["path"] == "/workspace/report (1).pdf"
+    assert response["filename"] == "report (2).pdf"
+    assert response["path"] == "/workspace/report (2).pdf"
 
-    # 验证所有文件都存在
-    assert (workspace_dir / "report.pdf").exists()
-    assert (workspace_dir / "report (1).pdf").exists()
-    assert (workspace_dir / "report (3).pdf").exists()
+    # 已有文件不被覆盖，新文件内容正确
+    assert (workspace_dir / "report.pdf").read_bytes() == b"original"
+    assert (workspace_dir / "report (1).pdf").read_bytes() == b"v1"
+    assert (workspace_dir / "report (2).pdf").read_bytes() == b"new"
 
 
 @pytest.mark.asyncio
@@ -1227,16 +1232,21 @@ async def test_upload_concurrent_generates_unique_filenames(
     filenames = [r["filename"] for r in responses]
     # 所有文件名必须唯一
     assert len(set(filenames)) == 5
-    assert "report.pdf" in filenames
-    assert "report (1).pdf" in filenames
-    assert "report (2).pdf" in filenames
-    assert "report (3).pdf" in filenames
-    assert "report (4).pdf" in filenames
+    assert set(filenames) == {
+        "report.pdf",
+        "report (1).pdf",
+        "report (2).pdf",
+        "report (3).pdf",
+        "report (4).pdf",
+    }
 
-    # 验证所有文件内容正确
+    # 内容完整性：5 份内容各出现且仅出现一次。
+    # 不断言「第 i 个响应对应 v{i}」——真正的写入发生在 asyncio.to_thread 里，
+    # 5 个线程竞争 open(..., "xb")，谁抢到 report.pdf 是不确定的；
+    # gather 只保证返回值顺序对应入参顺序，不保证落盘顺序。
     workspace_dir = service._get_workspace_dir("local_default", "task-upload-concurrent")
-    for i, name in enumerate(filenames):
-        assert (workspace_dir / name).read_text() == f"v{i}"
+    contents = sorted((workspace_dir / name).read_text() for name in filenames)
+    assert contents == ["v0", "v1", "v2", "v3", "v4"]
 
 
 @pytest.mark.asyncio
@@ -1518,8 +1528,12 @@ async def test_global_upload_numbered_filename_increments_existing_suffix(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_global_upload_skips_gap_and_picks_first_available_number(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """编号有时空缺时选择第一个可用编号（全局工作区）"""
+async def test_global_upload_increments_past_occupied_numbers(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """递增试探：从 (1) 起逐个尝试，跳过已占用编号（全局工作区）
+
+    实现不扫描目录找空缺，而是从候选名开始逐个递增：
+    report.pdf 占用 → report (1).pdf 占用 → report (2).pdf 可用。
+    """
     service = _build_workspace_service(tmp_path)
     _patch_file_route_workspace(monkeypatch, tmp_path, service)
 
@@ -1533,11 +1547,11 @@ async def test_global_upload_skips_gap_and_picks_first_available_number(tmp_path
 
     global_root = config_module.get_user_global_workspace_dir("local_default")
 
-    # 创建 report.pdf 和 report (3).pdf
+    # 预置连续占用的 report.pdf 与 report (1).pdf
     (global_root / "report.pdf").write_bytes(b"original")
-    (global_root / "report (3).pdf").write_bytes(b"v3")
+    (global_root / "report (1).pdf").write_bytes(b"v1")
 
-    # 上传 report.pdf，应生成 report (1).pdf（第一个可用编号）
+    # 上传 report.pdf：(1) 已占用，应递增到 (2)
     upload = UploadFile(file=io.BytesIO(b"new"), filename="report.pdf")
     response = await workspace_files_route.upload_global_workspace_file(
         workspace.workspace_id,
@@ -1545,13 +1559,13 @@ async def test_global_upload_skips_gap_and_picks_first_available_number(tmp_path
         current_user=_build_user(),
     )
 
-    assert response["filename"] == "report (1).pdf"
-    assert response["path"] == "/global/report (1).pdf"
+    assert response["filename"] == "report (2).pdf"
+    assert response["path"] == "/global/report (2).pdf"
 
-    # 验证所有文件都存在
-    assert (global_root / "report.pdf").exists()
-    assert (global_root / "report (1).pdf").exists()
-    assert (global_root / "report (3).pdf").exists()
+    # 已有文件不被覆盖，新文件内容正确
+    assert (global_root / "report.pdf").read_bytes() == b"original"
+    assert (global_root / "report (1).pdf").read_bytes() == b"v1"
+    assert (global_root / "report (2).pdf").read_bytes() == b"new"
 
 
 @pytest.mark.asyncio
@@ -1748,15 +1762,18 @@ async def test_global_upload_concurrent_generates_unique_filenames(tmp_path: Pat
     filenames = [r["filename"] for r in responses]
     # 所有文件名必须唯一
     assert len(set(filenames)) == 5
-    assert "report.pdf" in filenames
-    assert "report (1).pdf" in filenames
-    assert "report (2).pdf" in filenames
-    assert "report (3).pdf" in filenames
-    assert "report (4).pdf" in filenames
+    assert set(filenames) == {
+        "report.pdf",
+        "report (1).pdf",
+        "report (2).pdf",
+        "report (3).pdf",
+        "report (4).pdf",
+    }
 
-    # 验证所有文件内容正确
-    for i, name in enumerate(filenames):
-        assert (global_root / name).read_text() == f"v{i}"
+    # 内容完整性：5 份内容各出现且仅出现一次。
+    # 不断言「第 i 个响应对应 v{i}」——写入在线程池里竞争 open(..., "xb")，落盘顺序不确定。
+    contents = sorted((global_root / name).read_text() for name in filenames)
+    assert contents == ["v0", "v1", "v2", "v3", "v4"]
 
 
 @pytest.mark.asyncio
