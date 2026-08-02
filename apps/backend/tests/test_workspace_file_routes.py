@@ -830,6 +830,83 @@ async def test_running_session_rejects_manual_notebook_edit(
     assert exc_info.value.status_code == 409
 
 
+# ==================== 重名编号纯函数单元测试 ====================
+#
+# split_base_and_ext 与 get_next_numbered_name 是纯字符串函数，命名规则的边界
+# （多段扩展名、点文件、已带编号、名字里本就含括号数字）用参数化单测覆盖即可，
+# 无需为每个分支建工作区 + 发 HTTP 请求。下方的集成测试只验证「路由确实接上了
+# 这套规则」与并发/清理等 IO 语义，不再逐个枚举命名分支。
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        # 常规：末尾一段为扩展名
+        ("report.pdf", ("report", ".pdf")),
+        # 多段扩展名：只切最后一段，与系统行为一致
+        ("file.tar.gz", ("file.tar", ".gz")),
+        # 无扩展名
+        ("README", ("README", "")),
+        # 纯点文件：整体视为主干，无扩展名（dot_pos == 0）
+        (".env", (".env", "")),
+        (".gitignore", (".gitignore", "")),
+        # 点文件带真扩展名：点不在首位之外还有分隔点，正常切分
+        (".eslintrc.json", (".eslintrc", ".json")),
+        # 末尾是点：dot_pos > 0，扩展名为单个点
+        ("weird.", ("weird", ".")),
+        # 名字中含空格与括号
+        ("my report (2026).pdf", ("my report (2026)", ".pdf")),
+    ],
+)
+def test_split_base_and_ext(filename: str, expected: tuple[str, str]) -> None:
+    assert workspace_files_route.split_base_and_ext(filename) == expected
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        # 首次编号
+        ("report.pdf", "report (1).pdf"),
+        # 已有编号则递增
+        ("report (1).pdf", "report (2).pdf"),
+        ("report (9).pdf", "report (10).pdf"),
+        # 多位数递增
+        ("report (99).pdf", "report (100).pdf"),
+        # 多段扩展名：编号插在最后一个点之前
+        ("file.tar.gz", "file.tar (1).gz"),
+        # 无扩展名
+        ("README", "README (1)"),
+        ("README (1)", "README (2)"),
+        # 纯点文件：编号追加在整体之后（与资源管理器对无扩展名文件的行为一致）
+        (".env", ".env (1)"),
+        (".env (1)", ".env (2)"),
+        # 名字里本就含「(数字)」但不在末尾：不应误认为编号，需在其后新增编号
+        ("file (2026) final.pdf", "file (2026) final (1).pdf"),
+        # 末尾括号数字紧贴文字（无空格）：不匹配编号模式，视为名字的一部分
+        ("report(1).pdf", "report(1) (1).pdf"),
+    ],
+)
+def test_get_next_numbered_name(filename: str, expected: str) -> None:
+    assert workspace_files_route.get_next_numbered_name(filename) == expected
+
+
+def test_get_next_numbered_name_is_idempotent_under_repetition() -> None:
+    """连续调用应产生单调递增的编号序列，不出现重复或跳号。"""
+    name = "report.pdf"
+    produced = []
+    for _ in range(5):
+        name = workspace_files_route.get_next_numbered_name(name)
+        produced.append(name)
+
+    assert produced == [
+        "report (1).pdf",
+        "report (2).pdf",
+        "report (3).pdf",
+        "report (4).pdf",
+        "report (5).pdf",
+    ]
+
+
 # ==================== 工作区上传重名测试 ====================
 
 
